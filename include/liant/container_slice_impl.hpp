@@ -49,10 +49,10 @@ struct ContainerPtr<ContainerPtrKind::RawRef> {
     ContainerPtr(std::shared_ptr<ContainerBase> container)
         : inner(container.get()) {}
 
-    ContainerBase* raw() const {
+    void* asRaw() const {
         return inner;
     }
-    std::shared_ptr<ContainerBase> owner() const {
+    std::shared_ptr<ContainerBase> asShared() const {
         return inner->shared_from_this();
     }
 };
@@ -70,23 +70,23 @@ struct ContainerPtr<ContainerPtrKind::Shared> {
     template <ContainerPtrKind PtrKindOther>
         requires(PtrKindOther == ContainerPtrKind::RawRef)
     ContainerPtr(const ContainerPtr<PtrKindOther>& containerPtr)
-        : inner(containerPtr.owner()) {}
+        : inner(containerPtr.asShared()) {}
 
     ContainerPtr(std::shared_ptr<ContainerBase> container)
         : inner(std::move(container)) {}
 
-    ContainerBase* raw() const {
+    void* asRaw() const {
         return inner.get();
     }
-    const std::shared_ptr<ContainerBase>& owner() const {
+    const std::shared_ptr<ContainerBase>& asShared() const {
         return inner;
     }
 };
 
 template <typename TInterface>
 struct VTable {
-    auto (*findRawErased)(const VTable<TInterface>& self, liant::ContainerBase& container) -> TInterface*;
-    auto (*resolveRawErased)(const VTable<TInterface>& self, liant::ContainerBase& container) -> TInterface&;
+    auto (*findRawErased)(const VTable<TInterface>& self, void* container, const void* vtableBaseSliceErased) -> TInterface*;
+    auto (*resolveRawErased)(const VTable<TInterface>& self, void* container, const void* vtableBaseSliceErased) -> TInterface&;
 
     template <typename TContainer>
     TInterface* findRaw(TContainer& container) const {
@@ -102,95 +102,30 @@ struct VTable {
 // MSVC compiler (19.38) doesn't like it to be defined inside ContainerSliceImpl class
 // So unfortunately, we're forced to move these guts out of ContainerSliceImpl class scope
 template <typename TContainer, typename... TInterfaces>
-static constexpr std::tuple<VTable<TInterfaces>...> vtablesFor = { VTable<TInterfaces>{
-    [](const VTable<TInterfaces>& self, ContainerBase& container) -> TInterfaces* {
-        return self.findRaw(static_cast<TContainer&>(container));
+static constexpr std::tuple<VTable<TInterfaces>...> vtablesForContainer = { VTable<TInterfaces>{
+    [](const VTable<TInterfaces>& self, void* container, const void*) -> TInterfaces* {
+        return self.findRaw(*static_cast<TContainer*>(container));
     },
-    [](const VTable<TInterfaces>& self, ContainerBase& container) -> TInterfaces& {
-        return self.resolveRaw(static_cast<TContainer&>(container));
+    [](const VTable<TInterfaces>& self, void* container, const void*) -> TInterfaces& {
+        return self.resolveRaw(*static_cast<TContainer*>(container));
     },
 }... };
 
+template <typename TSlice, typename... TInterfaces>
+static constexpr std::tuple<VTable<TInterfaces>...> vtablesForSlice = { VTable<TInterfaces>{
+    [](const VTable<TInterfaces>& self, void* container, const void* vtableBaseSliceErased) -> TInterfaces* {
+        const auto* vtableBaseSlice = static_cast<const typename TSlice::VTableTuple*>(vtableBaseSliceErased);
+        const auto& vtableItem = std::get<VTable<TInterfaces>>(*vtableBaseSlice);
 
-// This is another layer of indirection after VTable<Interface>
-// The thing is that liant::ContainerSlice may be created from either liant::Container or from another liant::ContainerSlice.
-// And in each case we have different kinds of vtables:
-// - while we're creating ContainerSlice from Container we need to erase Container (i.e. vtable which erases liant::Container methods)
-// - while we're creating ContainerSlice from ContainerSlice we need to erase ContainerSlice (i.e. vtable which erases liant::ContainerSlice methods)
-// So we need to be able to abstract away the vtables themselves - hence this VTables class.
-template <typename... TInterfaces>
-class VTables {
-    template <typename... UInterfaces>
-    friend class VTables;
+        return (*vtableItem.findRawErased)(self, container, nullptr);
+    },
+    [](const VTable<TInterfaces>& self, void* container, const void* vtableBaseSliceErased) -> TInterfaces& {
+        const auto* vtableBaseSlice = static_cast<const typename TSlice::VTableTuple*>(vtableBaseSliceErased);
+        const auto& vtableItem = std::get<VTable<TInterfaces>>(*vtableBaseSlice);
 
-    template <typename TInterface>
-    using VTableGetter = auto (*)(const void* vtablesTupleErased, const void* vtableGettersTupleErased)
-        -> const VTable<TInterface>&;
-
-    template <typename VTablesTuple>
-    static constexpr std::tuple<VTableGetter<TInterfaces>...> vtableGettersFromContainerVTables = { //
-        [](const void* vtablesTupleErased, const void*) -> const VTable<TInterfaces>& {
-            return std::get<VTable<TInterfaces>>(*static_cast<const VTablesTuple*>(vtablesTupleErased));
-        }...
-    };
-
-    template <typename VTableGettersTuple>
-    static constexpr std::tuple<VTableGetter<TInterfaces>...> vtableGettersFromSliceVTableGetters = { //
-        [](const void* vtablesTupleErased, const void* vtableGettersTupleErased) -> const VTable<TInterfaces>& {
-            auto* vtableGettersTuple = static_cast<const VTableGettersTuple*>(vtableGettersTupleErased);
-            auto& vtableGetter = std::get<VTableGetter<TInterfaces>>(*vtableGettersTuple);
-
-            // delegate getting the vtable to the "vtableGettersFromContainerVTables"
-            return vtableGetter(vtablesTupleErased, nullptr);
-        }...
-    };
-
-public:
-    // Create ContainerSlice vtables from Container vtables
-    // "{Ts...} set should be included in {Us...}"
-    template <typename... UInterfaces>
-    VTables(const std::tuple<VTable<UInterfaces>...>* containerVTables)
-        : vtableGetters(std::addressof(vtableGettersFromContainerVTables<std::tuple<VTable<UInterfaces>...>>))
-        , vtablesTupleErased(containerVTables) {}
-
-
-    // Create ContainerSlice vtables from another ContainerSlice vtables
-    // "{Ts...} set should be included in {Us...}"
-    template <typename... UInterfaces>
-    VTables(const VTables<UInterfaces...>& sliceVTables)
-        : vtableGetters(std::addressof(vtableGettersFromSliceVTableGetters<std::tuple<VTableGetter<UInterfaces>...>>))
-        , vtablesTupleErased(sliceVTables.vtablesTupleErased)
-        , vtableGettersTupleErased(sliceVTables.vtableGetters) {}
-
-    // Create ContainerSlice vtables from another ContainerSlice vtables
-    // "{Ts...} set should be included in {Us...}"
-    template <typename... UInterfaces>
-    VTables& operator=(const VTables<UInterfaces...>& sliceVTables) {
-        vtableGetters = std::addressof(vtableGettersFromSliceVTableGetters<std::tuple<VTableGetter<UInterfaces>...>>);
-        vtablesTupleErased = sliceVTables.vtablesTupleErased;
-        vtableGettersTupleErased = sliceVTables.vtableGetters;
-
-        return *this;
-    }
-
-    VTables(const VTables&) = default;
-    VTables& operator=(const VTables&) = default;
-
-    template <typename TInterface>
-    const VTable<TInterface>& get() const {
-        auto& vtableGetter = std::get<VTableGetter<TInterface>>(*vtableGetters);
-        return vtableGetter(vtablesTupleErased, vtableGettersTupleErased);
-    }
-
-private:
-    const std::tuple<VTableGetter<TInterfaces>...>* vtableGetters{};
-
-    // vtables for erased liant::Container methods
-    const void* vtablesTupleErased{};
-    // vtable getters of a "parent" liant::ContainerSlice which this liant::ContainerSlice was constructed from
-    // under the hood these getters will delegate vtables resolving to the root "vtablesTupleErased"
-    const void* vtableGettersTupleErased{};
-};
+        return (*vtableItem.resolveRawErased)(self, container, nullptr);
+    },
+}... };
 
 // common base class for liant::ContainerSlice (owning) & liant::ContainerView (non-owning)
 template <ContainerPtrKind PtrKind, typename... TInterfaces>
@@ -201,21 +136,22 @@ class ContainerSliceImpl : public liant::PrettyDependency<ContainerSliceImpl<Ptr
     template <ContainerPtrKind PtrKindOther, typename... UInterfaces>
     friend class ContainerSliceImpl;
 
-    // 'VTables<...>' is another layer of type-erasure indirection
-    // 'VTable<TInterface>' erases liant::Container interface
-    // 'VTables<TInterfaces...>' erases vtables themselves (it could be Container vtable or ContainerSlice vtable under the hood)
-    VTables<TInterfaces...> vtables{};
+    const std::tuple<VTable<TInterfaces>...>* vtable{};
+    const void* vtableBaseSlice{};
 
 public:
+    using Interfaces = TypeList<TInterfaces...>;
+    using VTableTuple = std::tuple<VTable<TInterfaces>...>;
+
     template <typename UBaseContainer, typename... UTypeMappings>
     ContainerSliceImpl(const std::shared_ptr<Container<UBaseContainer, UTypeMappings...>>& container)
-        : vtables(std::addressof(vtablesFor<Container<UBaseContainer, UTypeMappings...>, TInterfaces...>))
+        : vtable(std::addressof(vtablesForContainer<Container<UBaseContainer, UTypeMappings...>, TInterfaces...>))
         , container(container) {
         resolveAll();
     }
     template <typename UBaseContainer, typename... UTypeMappings>
     ContainerSliceImpl(std::shared_ptr<Container<UBaseContainer, UTypeMappings...>>&& container)
-        : vtables(std::addressof(vtablesFor<Container<UBaseContainer, UTypeMappings...>, TInterfaces...>))
+        : vtable(std::addressof(vtablesForContainer<Container<UBaseContainer, UTypeMappings...>, TInterfaces...>))
         , container(std::move(container)) {
         resolveAll();
     }
@@ -223,19 +159,22 @@ public:
     template <ContainerPtrKind PtrKindOther, typename... UInterfaces>
         requires liant::IsSubsetOf<TypeList<TInterfaces...>, TypeList<UInterfaces...>>::value
     ContainerSliceImpl(const ContainerSliceImpl<PtrKindOther, UInterfaces...>& other)
-        : vtables(other.vtables)
+        : vtable(std::addressof(vtablesForSlice<ContainerSliceImpl<PtrKindOther, UInterfaces...>, TInterfaces...>))
+        , vtableBaseSlice(other.vtable)
         , container(other.container) {}
 
     template <ContainerPtrKind PtrKindOther, typename... UInterfaces>
         requires liant::IsSubsetOf<TypeList<TInterfaces...>, TypeList<UInterfaces...>>::value
     ContainerSliceImpl(ContainerSliceImpl<PtrKindOther, UInterfaces...>&& other)
-        : vtables(other.vtables)
+        : vtable(std::addressof(vtablesForSlice<ContainerSliceImpl<PtrKindOther, UInterfaces...>, TInterfaces...>))
+        , vtableBaseSlice(other.vtable)
         , container(std::move(other.container)) {}
 
     template <ContainerPtrKind PtrKindOther, typename... UInterfaces>
         requires liant::IsSubsetOf<TypeList<TInterfaces...>, TypeList<UInterfaces...>>::value
     ContainerSliceImpl& operator=(const ContainerSliceImpl<PtrKindOther, UInterfaces...>& other) {
-        vtables = other.vtables;
+        vtable = std::addressof(vtablesForSlice<ContainerSliceImpl<PtrKindOther, UInterfaces...>, TInterfaces...>);
+        vtableBaseSlice = other.vtable;
         container = other.container;
         return *this;
     }
@@ -243,7 +182,8 @@ public:
     template <ContainerPtrKind PtrKindOther, typename... UInterfaces>
         requires liant::IsSubsetOf<TypeList<TInterfaces...>, TypeList<UInterfaces...>>::value
     ContainerSliceImpl& operator=(ContainerSliceImpl<PtrKindOther, UInterfaces...>&& other) {
-        vtables = std::move(other.vtables);
+        vtable = std::addressof(vtablesForSlice<ContainerSliceImpl<PtrKindOther, UInterfaces...>, TInterfaces...>);
+        vtableBaseSlice = other.vtable;
         container = std::move(other.container);
         return *this;
     }
@@ -261,15 +201,15 @@ public:
             "Interface you're trying to find is missing from ContainerSlice<...> / "
             "ContainerView<...> (search 'liant::Print' in the compilation output for details)");
 
-        const VTable<TInterface>& vtableItem = vtables.template get<TInterface>();
-        return (*vtableItem.findRawErased)(vtableItem, *container.raw());
+        const VTable<TInterface>& vtableItem = std::get<VTable<TInterface>>(*vtable);
+        return (*vtableItem.findRawErased)(vtableItem, container.asRaw(), vtableBaseSlice);
     }
 
     // trying to find already created instance registered 'as TInterface'
     // returned fat 'SharedRef' protects underlying 'Container' from being destroyed so use 'SharedRef' with caution (you don't really want block 'Container' deletion)
     template <typename TInterface>
     SharedPtr<TInterface> find() const {
-        return SharedPtr<TInterface>(findRaw<TInterface>(), container.owner());
+        return SharedPtr<TInterface>(findRaw<TInterface>(), container.asShared());
     }
 
     // resolve an instance of type registered 'as TInterface'
@@ -279,8 +219,8 @@ public:
     // if such instance already exists then just return it, statically casted to 'TInterface'
     template <typename TInterface>
     TInterface& resolveRaw() {
-        const VTable<TInterface>& vtableItem = vtables.template get<TInterface>();
-        return (*vtableItem.resolveRawErased)(vtableItem, *container.raw());
+        const VTable<TInterface>& vtableItem = std::get<VTable<TInterface>>(*vtable);
+        return (*vtableItem.resolveRawErased)(vtableItem, container.asRaw(), vtableBaseSlice);
     }
 
     // resolve an instance of type registered 'as TInterface'
@@ -294,7 +234,7 @@ public:
             "Interface you're trying to resolve is missing from 'liant::ContainerSlice<...>' / "
             "'liant::ContainerView<...>' (search 'liant::Print' in the compilation output for details)");
 
-        return SharedRef<TInterface>(resolveRaw<TInterface>(), container.owner());
+        return SharedRef<TInterface>(resolveRaw<TInterface>(), container.asShared());
     }
 
     void resolveAll() {

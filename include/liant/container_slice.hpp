@@ -22,7 +22,7 @@ public:
     }
 
     auto useCount() const {
-        return this->container.owner().use_count();
+        return this->container.asShared().use_count();
     }
 };
 

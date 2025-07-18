@@ -220,4 +220,26 @@ TEST_CASE("should construct ContainerSlice from ContainerView with wider interfa
     REQUIRE_EQ(container->find<S4>()->i, 4);
 }
 
+TEST_CASE("ensure ContainerSlice assign to itself ain't broken") {
+    // clang-format off
+    auto container = liant::makeContainer(
+        liant::registerInstanceOf<S1>(),
+        liant::registerInstanceOf<S2>(),
+        liant::registerInstanceOf<S3>(),
+        liant::registerInstanceOf<S4>()
+    );
+    // clang-format on
+
+    liant::ContainerSlice<S1, S2, S3> slice(container);
+    REQUIRE_EQ(container.use_count(), 2);
+
+    slice = slice;
+    REQUIRE_EQ(container.use_count(), 2);
+
+    REQUIRE_EQ(container->find<S1>()->i, 1);
+    REQUIRE_EQ(container->find<S2>()->i, 2);
+    REQUIRE_EQ(container->find<S3>()->i, 3);
+    REQUIRE_FALSE(container->find<S4>());
+}
+
 } // namespace liant::test
